@@ -10,5 +10,11 @@ typedef struct
 	unsigned int length;
 } memclient_attach_dmabuf_param_t;
 
+#define MEMCLIENT_ATTACH_DMABUF		_IOWR('M', 0x01, memclient_attach_dmabuf_param_t)
+#define MEMCLIENT_RELEASE_DMABUF	_IOWR('M', 0x02, int)
+
+#define MEMCLIENT_ATTACH_UMP		_IOWR('M', 0x03, memclient_attach_dmabuf_param_t)
+#define MEMCLIENT_RELEASE_UMP		_IOWR('M', 0x04, int)
+
 
 #endif

@@ -7,6 +7,7 @@
 #include <linux/uaccess.h>
 #include <linux/list.h>
 #include <linux/slab.h>
+#include <../drivers/gpu/arm/ump/include/ump/ump_kernel_interface.h>
 
 #include "memclient.h"
 
@@ -15,9 +16,6 @@
 #define VERSION_MAJOR 0
 #define VERSION_MINOR 0
 #define DEVICE_NAME     "memclient"
-
-#define MEMCLIENT_ATTACH_DMABUF		_IOWR('M', 0x01, memclient_attach_dmabuf_param_t)
-#define MEMCLIENT_RELEASE_DMABUF	_IOWR('M', 0x02, int)
 
 
 
@@ -40,14 +38,52 @@ typedef struct
 
 typedef struct
 {
+	ump_secure_id secure_id;
+	ump_dd_handle mem;
+	struct list_head list;
+} ump_entry_t;
+
+typedef struct
+{
 	struct device* dev;
 	struct list_head entry_list;
+	struct list_head ump_list;
 } memclient_private_data_t;
 
 
 
 static memclient_dev_t memclient_dev;
 
+
+
+static ump_entry_t* memclient_find_ump_entry(struct list_head* entry_list, ump_secure_id secure_id)
+{
+	ump_entry_t* entry_ptr = NULL;
+
+	list_for_each_entry(entry_ptr, entry_list, list)
+	{
+		if (entry_ptr->secure_id == secure_id)
+		{
+			return entry_ptr;
+		}
+	}
+
+	return NULL;
+}
+
+static void memclient_release_ump_entry(ump_entry_t* entry)
+{
+	//printk(KERN_INFO "memclient_release_ump_entry\n");
+
+	if (entry)
+	{
+		//printk(KERN_INFO "memclient_release_ump_entry: freeing ump handle (%p)\n", entry->mem);
+
+		ump_dd_reference_release(entry->mem);
+
+		kfree(entry);
+	}
+}
 
 
 static attach_entry_t* memclient_find_entry(struct list_head* entry_list, int dmabuf_fd)
@@ -94,7 +130,7 @@ long memclient_ioctl(struct file *file, unsigned int cmd, ulong arg)
 	int dmabuf_fd = -1;
 
 
-	printk(KERN_INFO "memclient_ioctl\n");
+	//printk(KERN_INFO "memclient_ioctl\n");
 
 	switch (cmd)
 	{
@@ -246,6 +282,118 @@ long memclient_ioctl(struct file *file, unsigned int cmd, ulong arg)
 		}
 		break;
 
+
+	case MEMCLIENT_ATTACH_UMP:
+		{
+			ump_secure_id secure_id;
+			ump_dd_handle handle;
+			ump_dd_status_code status;
+			ump_dd_physical_block blocks[1];
+			ump_entry_t* ump_entry = NULL;
+
+
+			//printk(KERN_INFO "memclient_ioctl: MEMCLIENT_ATTACH_UMP\n");
+
+			// Get the parameters from user space
+			api = copy_from_user(&attach_dmabuf_param,
+				(void*)arg,
+				sizeof(attach_dmabuf_param));
+			if (api != 0)
+			{
+				printk(KERN_ALERT "memclient_ioctl: MEMCLIENT_ATTACH_UMP copy_from_user failed.\n");
+				return -1;	//TODO: error code
+			}
+
+			secure_id = attach_dmabuf_param.handle;
+			handle = ump_dd_handle_create_from_secure_id(secure_id);
+
+			if (ump_dd_phys_block_count_get(handle) != 1)
+			{
+				// Only one contiguous memory area is supported
+				printk(KERN_ALERT "memclient_ioctl: MEMCLIENT_ATTACH_UMP ump_dd_phys_block_count_get != 1.\n");
+				goto B_err1;
+			}
+
+			status = ump_dd_phys_blocks_get(handle, blocks, 1);
+			if (status != UMP_DD_SUCCESS)
+			{
+				printk(KERN_ALERT "memclient_ioctl: MEMCLIENT_ATTACH_UMP ump_dd_phys_blocks_get failed.\n");
+				goto B_err1;
+			}
+
+
+			// Allocate storage for the entry;
+			ump_entry = kmalloc(sizeof(ump_entry_t), GFP_KERNEL);
+			if (ump_entry == NULL)
+			{
+				printk(KERN_ALERT "memclient_ioctl: MEMCLIENT_ATTACH_UMP kmalloc failed.\n");
+				return -ENOMEM;
+			}
+
+			INIT_LIST_HEAD(&ump_entry->list);
+			ump_entry->secure_id = secure_id;
+			ump_entry->mem = handle;
+
+
+			// Record the entry
+			list_add(&ump_entry->list, &priv->ump_list);
+
+
+			// Return parameters to user
+			attach_dmabuf_param.physical_address = blocks[0].addr;
+			attach_dmabuf_param.length = blocks[0].size;
+
+			api = copy_to_user((void*)arg, &attach_dmabuf_param, sizeof(attach_dmabuf_param));
+			if (api != 0)
+			{
+				printk(KERN_ALERT "memclient_ioctl: MEMCLIENT_ATTACH_UMP copy_to_user failed.\n");
+				goto B_err2;
+			}
+
+
+			//printk(KERN_INFO "memclient_ioctl: MEMCLIENT_ATTACH_UMP handle=%p, paddr=%p length=%x\n",
+			//	handle,
+			//	(void*)attach_dmabuf_param.physical_address,
+			//	attach_dmabuf_param.length);
+
+			return 0;
+
+
+		B_err2:
+			list_del(&ump_entry->list);
+
+
+		B_err1:
+			memclient_release_ump_entry(ump_entry);
+
+			return -1; // TODO: error code
+		}
+		break;
+
+	case MEMCLIENT_RELEASE_UMP:
+		{
+			//ump_dd_handle handle;
+			ump_secure_id secure_id;
+			ump_entry_t* ump_entry;
+
+			//printk(KERN_INFO "memclient_ioctl: MEMCLIENT_RELEASE_UMP\n");
+
+
+			secure_id = (ump_secure_id)arg;
+			ump_entry = memclient_find_ump_entry(&priv->ump_list, secure_id);
+
+			if (ump_entry == NULL)
+			{
+				return -1; //todo error code
+			}
+
+			list_del(&ump_entry->list);
+			memclient_release_ump_entry(ump_entry);
+
+			return 0;
+		}
+		break;
+
 	default:
 		break;
 	}
@@ -269,6 +417,7 @@ static int memclient_open(struct inode *inode, struct file *file)
 
 	priv->dev = memclient_dev.file_device;
 	INIT_LIST_HEAD(&priv->entry_list);
+	INIT_LIST_HEAD(&priv->ump_list);
 	
 	file->private_data = priv;
 
@@ -281,6 +430,8 @@ static int memclient_release(struct inode *inode, struct file *file)
 	memclient_private_data_t* priv = file->private_data;
 	attach_entry_t* entry = NULL;
 	attach_entry_t* temp = NULL;
+	ump_entry_t* ump_entry = NULL;
+	ump_entry_t* ump_temp = NULL;
 
 
 	printk(KERN_INFO "memclient_release\n");
@@ -292,6 +443,11 @@ static int memclient_release(struct inode *inode, struct file *file)
 		memclient_release_entry(entry);
 	}
 
+	list_for_each_entry_safe(ump_entry, ump_temp, &priv->ump_list, list)
+	{
+		list_del(&ump_entry->list);
+		memclient_release_ump_entry(ump_entry);
+	}
 
 	kfree(priv);
 
